@@ -5,6 +5,9 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.zhongyuan.cachedemo.domain.Product;
 import com.zhongyuan.cachedemo.mapper.ProductMapper;
 import com.zhongyuan.cachedemo.service.ProductService;
+
+import jodd.util.concurrent.ThreadFactoryBuilder;
+
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -16,6 +19,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -29,6 +35,20 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product>
 
     public static final int MAX_REDIS_CACHE_ITEM_COUNT = 600;
     public static final double REMOVE_RATE = 0.2;
+    private final ExecutorService executorService = new ThreadPoolExecutor(
+    2,                                 // 核心线程数
+    5,                                 // 最大线程数
+    60L,                               // 空闲线程存活时间
+    TimeUnit.SECONDS,                  // 时间单位
+    new LinkedBlockingQueue<>(100),    // 工作队列
+    r -> {
+        Thread thread = new Thread(r, "product-service-pool-" + Thread.currentThread().getId());
+        thread.setDaemon(true);
+        return thread;
+    },  // 自定义线程工厂，设置有意义的线程名称和守护线程
+    new ThreadPoolExecutor.CallerRunsPolicy()  // 拒绝策略
+);
+
     private final String zsetKey = "hot:product";
     @Resource
     RedissonClient redissonClient;
@@ -36,7 +56,6 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product>
     Cache<String, Object> productCacheManager;
     @Resource
     private RedisTemplate<String, Object> redisTemplate;
-
     public String getCaffeineKey(Serializable id) {
         return "product:local:" + id;
     }
@@ -44,7 +63,6 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product>
     public String getRedisKey(Serializable id) {
         return "product:redis:" + id;
     }
-
 
     @Override
     public Product getById(Serializable id) {
@@ -80,8 +98,8 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product>
 
     private void checkRedisUsage() {
         Long count = redisTemplate.opsForZSet().count(zsetKey, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
+        // 外部先检查一次
         if (count != null && count > MAX_REDIS_CACHE_ITEM_COUNT) {
-            ExecutorService executorService = Executors.newFixedThreadPool(10);
             executorService.submit(() -> {
                 RLock lock = redissonClient.getLock("DELETE");
                 try {
@@ -92,11 +110,16 @@ public class ProductServiceImpl extends ServiceImpl<ProductMapper, Product>
                             System.out.println("!delete触发!");
                             Set<Object> range = redisTemplate.opsForZSet().range(zsetKey, 0, removeCount);
                             if (range != null) {
+                                // 转换成redis的key
                                 List<String> collect = range.stream().map(r ->
                                         getRedisKey((Serializable) r)
-                                ).collect(Collectors.toList());
+                                        ).collect(Collectors.toList());
+                                // 删除redis
                                 redisTemplate.delete(collect);
+                                // 淘汰
                                 redisTemplate.opsForZSet().removeRange(zsetKey, 0, removeCount);
+                                // 为什么淘汰caffine,回收效率太低，redis都LRU淘汰了,Caffine八成已经过期了所以再去淘汰Caffine 没啥意义
+                                // Cafffine 手动淘汰只会发生在 Update 阶段
                             }
                         }
                     }

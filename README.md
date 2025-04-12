@@ -4,6 +4,31 @@
 
 这是一个基于 Spring Boot 的多级缓存演示项目，实现了本地缓存（Caffeine）和分布式缓存（Redis）的结合使用。项目展示了如何通过多级缓存来提升系统性能，并实现了防止缓存雪崩等常见缓存问题的解决方案。
 
+## 核心特性
+
+1. **多级缓存架构**
+
+   - 本地缓存：Caffeine
+   - 分布式缓存：Redis
+   - 数据库：MySQL
+
+2. **热点数据处理**
+
+   - 使用 Redis ZSet 记录访问热度
+   - 实现滑动窗口机制筛选持续热门商品
+   - 自动清理过期数据
+
+3. **并发控制**
+
+   - 使用 Redisson 分布式锁
+   - 异步处理清理任务
+   - 线程池管理
+
+4. **性能优化**
+   - 批量操作优化
+   - 缓存预热机制
+   - 容量控制机制
+
 ## 流程图
 
 ### 1. 缓存读取流程
@@ -46,6 +71,17 @@ graph TD
     H --> L
 ```
 
+### 3. 热点数据处理流程
+
+```mermaid
+graph TD
+    A[定时任务触发] --> B[获取热门商品ID]
+    B --> C[更新Redis Set]
+    C --> D[计算Set交集]
+    D --> E[批量获取商品数据]
+    E --> F[更新本地缓存]
+```
+
 ## 技术栈
 
 - 核心框架：Spring Boot 2.6.13
@@ -71,10 +107,14 @@ src/main/java/com/zhongyuan/cachedemo/
 │   ├── RedisConfig.java      # Redis配置
 │   └── RedissonConfig.java   # Redisson配置
 ├── domain/          # 实体类目录
+│   └── Product.java         # 商品实体类
 ├── mapper/          # MyBatis映射接口目录
 ├── service/         # 服务层目录
-│   └── cache/      # 缓存相关实现
-│       └── ProductCache.java # 产品缓存配置
+│   ├── ProductService.java  # 服务接口
+│   └── impl/               # 服务实现
+│       └── ProductServiceImpl.java
+├── scheduled/       # 定时任务目录
+│   └── CacheTask.java      # 缓存同步任务
 └── CacheDemoApplication.java # 应用程序入口
 ```
 
@@ -113,36 +153,50 @@ public Product getById(Serializable id) {
 }
 ```
 
-### 2. 热点数据管理
+### 2. 热点数据处理
 
-- 使用 Redis ZSet 记录数据访问热度
-- 通过时间戳作为 score，实现访问时间排序
-- 支持热点数据自动识别
+```java
+@Scheduled(fixedRate = 5000)
+public void loadCacheToLocal() {
+    // 获取热门商品ID
+    Set<Object> hotProductIds = redisTemplate.opsForZSet()
+        .reverseRange(zsetKey, 0, HOT_PRODUCT_LIMIT);
 
-### 3. 缓存容量控制
+    // 更新Redis Set
+    String currentSetKey = setKeyPrefix + (currentCount % SET_COUNT);
+    redisTemplate.delete(currentSetKey);
+    redisTemplate.opsForSet().add(currentSetKey, hotProductIds);
+
+    // 计算Set交集
+    Set<Object> intersect = redisTemplate.opsForSet()
+        .intersect(setKeys);
+
+    // 更新本地缓存
+    if (!intersect.isEmpty()) {
+        productCache.putAll(cacheMap);
+    }
+}
+```
+
+### 3. 缓存清理机制
 
 ```java
 private void checkRedisUsage() {
-    // 检查Redis缓存数量
-    Long count = redisTemplate.opsForZSet().count(zsetKey, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
+    Long count = redisTemplate.opsForZSet()
+        .count(zsetKey, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
     if (count != null && count > MAX_REDIS_CACHE_ITEM_COUNT) {
-        // 使用线程池异步清理
-        ExecutorService executorService = Executors.newFixedThreadPool(10);
         executorService.submit(() -> {
-            // 使用分布式锁确保并发安全
             RLock lock = redissonClient.getLock("DELETE");
             try {
                 if (lock.tryLock()) {
-                    // 清理最久未访问的数据
+                    // 清理过期数据
                     int removeCount = (int) (MAX_REDIS_CACHE_ITEM_COUNT * REMOVE_RATE);
-                    Set<Object> range = redisTemplate.opsForZSet().range(zsetKey, 0, removeCount);
+                    Set<Object> range = redisTemplate.opsForZSet()
+                        .range(zsetKey, 0, removeCount);
                     if (range != null) {
-                        // 批量删除过期数据
-                        List<String> keys = range.stream()
-                            .map(r -> getRedisKey((Serializable) r))
-                            .collect(Collectors.toList());
-                        redisTemplate.delete(keys);
-                        redisTemplate.opsForZSet().removeRange(zsetKey, 0, removeCount);
+                        redisTemplate.delete(collect);
+                        redisTemplate.opsForZSet()
+                            .removeRange(zsetKey, 0, removeCount);
                     }
                 }
             } finally {
@@ -153,31 +207,62 @@ private void checkRedisUsage() {
 }
 ```
 
-### 4. 缓存策略特点
+## 性能优化
 
-1. 多级缓存读取
+1. **批量操作优化**
 
-   - 本地缓存（Caffeine）→ Redis 缓存 → 数据库
-   - 逐级回填，提升访问速度
+   - 使用 Redis 的批量删除命令
+   - 使用 Set 交集操作
+   - 批量更新本地缓存
 
-2. 热点数据识别
+2. **并发控制**
 
-   - 使用 ZSet 记录访问时间
-   - 支持热点数据自动发现
-   - 实现数据访问热度统计
+   - 使用分布式锁保证原子性
+   - 异步处理清理任务
+   - 线程池管理
 
-3. 容量控制
+3. **内存管理**
+   - 设置缓存容量上限
+   - 实现自动清理机制
+   - 使用滑动窗口筛选热点数据
 
-   - Redis 缓存上限：600 条
-   - 清理比例：20%
-   - 异步清理机制
-   - 分布式锁保证并发安全
+## 注意事项
 
-4. 性能优化
-   - 本地缓存随机过期（5-10 分钟）
-   - 异步清理过期数据
-   - 批量删除提升效率
-   - 线程池处理清理任务
+1. **缓存一致性**
+
+   - 使用分布式锁保证并发安全
+   - 实现缓存更新策略
+   - 处理缓存失效情况
+
+2. **性能考虑**
+
+   - 合理设置缓存容量
+   - 优化清理策略
+   - 控制更新频率
+
+3. **异常处理**
+   - Redis 连接异常处理
+   - 分布式锁异常处理
+   - 线程池异常处理
+
+## 扩展建议
+
+1. **监控告警**
+
+   - 添加缓存命中率监控
+   - 实现性能指标收集
+   - 设置告警阈值
+
+2. **集群支持**
+
+   - 使用 Redis Cluster
+   - 实现缓存分片
+   - 添加负载均衡
+
+3. **功能增强**
+   - 添加缓存预热
+   - 实现缓存降级
+   - 优化清理策略
 
 ## 环境要求
 
@@ -247,27 +332,6 @@ public class RedisConfig {
     }
 }
 ```
-
-## 注意事项
-
-1. Redis 配置
-
-   - 默认使用 localhost:6379
-   - 使用数据库 2
-   - 支持自定义配置
-
-2. 缓存策略
-
-   - 本地缓存使用随机过期时间（5-10 分钟）
-   - Redis 缓存上限 600 条
-   - 超过上限自动清理 20%最久未访问数据
-   - 使用分布式锁保证并发安全
-
-3. 性能优化
-   - 合理设置缓存大小
-   - 注意缓存命中率
-   - 避免缓存穿透
-   - 异步处理清理任务
 
 ## 常见问题
 

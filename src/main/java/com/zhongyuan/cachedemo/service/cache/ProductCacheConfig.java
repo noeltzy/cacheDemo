@@ -13,10 +13,10 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 @Configuration
-public class ProductCache {
+public class ProductCacheConfig {
 
     @Bean
-    public Cache<String,Object> ProductCacheManager() {
+    public Cache<String,Object> productCache() {
         Random random = new Random();
         return Caffeine.newBuilder().expireAfter(new Expiry<String, Object>() {
 
@@ -36,4 +36,6 @@ public class ProductCache {
             }
         }).build();
     }
+
+
 }
